@@ -7,4 +7,3 @@ altair
 matplotlib
 requests
 shapely
-numpy
