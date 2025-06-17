@@ -1,211 +1,217 @@
-import pandas as pd
-import geopandas as gpd
-import requests
-import json
-from shapely.geometry import shape
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
+import pandas as pd
 import folium
-from streamlit_folium import st_folium
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
-import altair as alt
+from folium.features import GeoJson
+from datetime import datetime, timedelta
+import json
+import requests
+import numpy as np # numpy import 추가 (만약 NaN 등을 사용한다면 필요)
 
-# ========== 사용자 경로 ==========
-CSV_PATH = "regioncode.csv"
-GEOJSON_PATH = "koreamap.geojson"
-
-API_KEY = "211b9b11afcd4fa1af0f4743cee9ea18"
-STATBL_ID = "A_2024_00045"
-ITM_ID = "100001"
-DTACYCLE_CD = "MM"
-
-def get_latest_yyyymm():
-    return datetime.today().strftime("%Y%m")
+# Streamlit secrets에서 API 키 가져오기
+api_key = st.secrets["API_KEY"]
 
 @st.cache_data
-def load_csv(path):
-    df = pd.read_csv(path)
-    cls_ids = df["분류코드"].astype(str).tolist()
-    cls_id_to_name_map = df.set_index("분류코드")["분류명"].to_dict()
-    return cls_ids, cls_id_to_name_map
-
-@st.cache_data
-def load_geojson(path):
-    with open(path, encoding="utf-8") as f:
-        geojson = json.load(f)
-    records = []
-    for feature in geojson["features"]:
-        props = feature["properties"]
-        props["geometry"] = shape(feature["geometry"])
-        records.append(props)
-    return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
-
-def fetch_index(cls_id, yyyymm):
-    url = "https://www.reb.or.kr/r-one/openapi/SttsApiTblData.do"
+def load_and_process_data(api_key):
+    # API 요청을 위한 파라미터 설정
+    url = "https://api.odcloud.kr/api/15096561/v1/uddi:731e21b8-7a13-40e8-8b77-d31e98d9e4a3"
     params = {
-        "ServiceKey": API_KEY,
-        "STATBL_ID": STATBL_ID,
-        "ITM_ID": ITM_ID,
-        "DTACYCLE_CD": DTACYCLE_CD,
-        "CLS_ID": cls_id,
-        "WRTTIME_IDTFR_ID": yyyymm,
-        "Type": "json"
+        "page": 1,
+        "perPage": 100000, # 충분히 큰 값으로 설정하여 모든 데이터 가져오기
+        "serviceKey": api_key
     }
+
     try:
-        resp = requests.get(url, params=params, timeout=5)
-        if resp.status_code != 200:
-            return None
-        j = resp.json()
-        rows = j.get("SttsApiTblData", [None, {}])[1].get("row", [])
-        if not rows:
-            return None
-        row = rows[0]
-        return {
-            "날짜": pd.to_datetime(yyyymm + "01"),
-            "CLS_ID": row["CLS_ID"],
-            "매매지수": float(row["DTA_VAL"])
-        }
-    except:
+        response = requests.get(url, params=params)
+        response.raise_for_status() # HTTP 오류 발생 시 예외 발생
+        data = response.json()
+        df = pd.DataFrame(data['data'])
+
+        # 필요한 컬럼만 선택
+        df = df[['조사기준일', 'CLS_ID', '매매지수']]
+
+        # '조사기준일' 컬럼을 datetime 형식으로 변환
+        df['날짜'] = pd.to_datetime(df['조사기준일'])
+        df = df.drop(columns=['조사기준일'])
+
+        # '매매지수' 컬럼을 숫자로 변환 (오류 발생 시 NaN)
+        df['매매지수'] = pd.to_numeric(df['매매지수'], errors='coerce')
+
+        # NaN 값 제거 (매매지수가 없는 데이터는 제외)
+        df.dropna(subset=['매매지수'], inplace=True)
+
+        return df
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"API 요청 중 오류가 발생했습니다: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
+        return pd.DataFrame()
+
+def calc_change(df_full, start_date, end_date):
+    df_e = df_full[(df_full['날짜'] >= start_date) & (df_full['날짜'] <= end_date)].copy()
+    df_s = df_full[(df_full['날짜'] >= start_date) & (df_full['날짜'] <= start_date)].copy()
+
+    if df_e.empty or df_s.empty:
+        return pd.DataFrame()
+
+    result_data = []
+    
+    # df_full의 CLS_ID 고유값을 기준으로 반복 (모든 지역을 커버하기 위함)
+    for cls_id_str in df_full["CLS_ID"].unique():
+        filtered_end_data = df_e[df_e["CLS_ID"] == cls_id_str]["매매지수"]
+        if not filtered_end_data.empty:
+            b = filtered_end_data.iloc[0]
+        else:
+            b = 0 # 데이터가 없을 경우 0으로 처리
+
+        filtered_start_data = df_s[df_s["CLS_ID"] == cls_id_str]["매매지수"]
+        if not filtered_start_data.empty:
+            a = filtered_start_data.iloc[0]
+        else:
+            a = 0 # 데이터가 없을 경우 0으로 처리
+
+        change_rate = ((b - a) / a) * 100 if a != 0 else 0
+        result_data.append({"CLS_ID": cls_id_str, "증감률": change_rate})
+
+    result_df = pd.DataFrame(result_data)
+    return result_df
+
+@st.cache_data
+def load_geojson():
+    try:
+        with open('SIG.geojson', 'r', encoding='utf-8') as f:
+            geojson_data = json.load(f)
+        return geojson_data
+    except FileNotFoundError:
+        st.error("SIG.geojson 파일을 찾을 수 없습니다. 파일이 프로젝트 루트 디렉토리에 있는지 확인해주세요.")
+        return None
+    except json.JSONDecodeError:
+        st.error("SIG.geojson 파일이 올바른 JSON 형식이 아닙니다.")
         return None
 
-def batch_fetch(cls_ids, start_yyyymm, end_yyyymm, cls_id_to_name_map):
-    periods = pd.period_range(start=start_yyyymm, end=end_yyyymm, freq="M").strftime("%Y%m")
-    tasks = [(cid, y) for y in periods for cid in cls_ids]
-    results = []
+def create_choropleth_map(df, geojson_data):
+    if df.empty or geojson_data is None:
+        return None
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        fetched_data = executor.map(fetch_index, [t[0] for t in tasks], [t[1] for t in tasks])
-        for rec in fetched_data:
-            if rec:
-                results.append(rec)
+    m = folium.Map(location=[36.5, 127.5], zoom_start=7, tiles="cartodbpositron")
 
-    df_full = pd.DataFrame(results)
-    if not df_full.empty:
-        df_full["CLS_NM"] = df_full["CLS_ID"].map(cls_id_to_name_map)
-        df_full = df_full.dropna(subset=["CLS_NM"])
-    return df_full
+    # 증감률 데이터 스케일 정규화 (색상 매핑을 위해)
+    min_val = df['증감률'].min()
+    max_val = df['증감률'].max()
 
-@st.cache_data(show_spinner=False)
-def cached_fetch(cls_ids, start_yyyymm, end_yyyymm, cls_id_to_name_map):
-    return batch_fetch(cls_ids, start_yyyymm, end_yyyymm, cls_id_to_name_map)
-
-def calc_change(df, start_date, end_date):
-    df["날짜"] = pd.to_datetime(df["날짜"])
-    s = min(df["날짜"], key=lambda x: abs(x - pd.to_datetime(start_date)))
-    e = min(df["날짜"], key=lambda x: abs(x - pd.to_datetime(end_date)))
-    st.write("📅 실제 시작일:", s.date(), "종료일:", e.date())
-
-    df_s = df[df["날짜"] == s]
-    df_e = df[df["날짜"] == e]
-
-    out = []
-    for cls_id_str in df_s["CLS_ID"].unique():
-        loc_name = df_s[df_s["CLS_ID"] == cls_id_str]["CLS_NM"].iloc[0]
-        a = df_s[df_s["CLS_ID"] == cls_id_str]["매매지수"].iloc[0]
-        b = df_e[df_e["CLS_ID"] == cls_id_str]["매매지수"].iloc[0]
-        out.append({
-            "지역코드": cls_id_str,
-            "지역명": loc_name,
-            "시작지수": round(a,2),
-            "종료지수": round(b,2),
-            "증감률(%)": round((b - a)/a*100, 2)
-        })
-    return pd.DataFrame(out)
-
-def merge_geo_data(geo_df, result_df):
-    return geo_df.merge(result_df, left_on="SIG_KOR_NM", right_on="지역명", how="left")
-
-def create_colormap(min_val, max_val):
-    norm = mcolors.Normalize(vmin=min_val, vmax=max_val)
-    cmap = cm.get_cmap("RdYlGn")
-    def get_color(val):
-        rgba = cmap(norm(val))
-        return mcolors.to_hex(rgba)
-    return get_color
-
-def plot_colormap_with_geojson(merged_gdf):
-    m = folium.Map(location=[36.5, 127.5], zoom_start=7)
-
-    min_val = merged_gdf["증감률(%)"].min()
-    max_val = merged_gdf["증감률(%)"].max()
-    get_color = create_colormap(min_val, max_val)
-
-    folium.GeoJson(
-        merged_gdf,
-        name="지역정보",
-        style_function=lambda f: {
-            "fillColor": get_color(f["properties"]["증감률(%)"])
-            if f["properties"]["증감률(%)"] is not None else "#8c8c8c",
-            "color": "black",
-            "weight": 0.2,
-            "fillOpacity": 0.7,
-        },
-        highlight_function=lambda f: {
-            "color": "black",
-            "weight": 2,
-            "fillOpacity": 0.9,
-        },
-        tooltip=folium.GeoJsonTooltip(
-            fields=["SIG_KOR_NM", "증감률(%)"],
-            aliases=["지역명", "증감률"],
-            localize=True,
-            sticky=True
-        )
-    ).add_to(m)
-
-    return st_folium(m, width=800, height=600)
-
-# ========== Streamlit 실행 ==========
-if __name__ == "__main__":
-    st.set_page_config(layout="wide")
-    st.title("📊 부동산 매매지수 증감률 분석 지도")
-
-    cls_ids, cls_id_to_name_map = load_csv(CSV_PATH)
-
-    with st.sidebar:
-        st.header("📅 분석 기간")
-        start_date_input = st.date_input("시작일", datetime(2022,1,1))
-        end_date_input = st.date_input("종료일", datetime.today())
-
-    latest_yyyymm = get_latest_yyyymm()
-    df_full = cached_fetch(cls_ids, start_date_input.strftime("%Y%m"), latest_yyyymm, cls_id_to_name_map)
-
-    if df_full.empty:
-        st.error("❌ 데이터 없음")
+    # 값의 범위가 너무 작거나 같으면 색상 매핑이 어려울 수 있으므로 기본값 설정
+    if min_val == max_val:
+        color_scale = ['#FFFFFF'] # 모든 값이 같으면 흰색
     else:
-        result_df = calc_change(df_full, start_date_input, end_date_input)
-        st.subheader("📈 증감률 데이터")
-        st.dataframe(result_df.sort_values("증감률(%)", ascending=False))
+        # cmap을 'RdYlGn'으로 설정하여 빨간색(감소), 노란색(변화없음), 초록색(증가)으로 표현
+        # vmin과 vmax는 데이터의 실제 최솟값과 최댓값을 사용
+        choropleth = folium.Choropleth(
+            geo_data=geojson_data,
+            data=df,
+            columns=['CLS_ID', '증감률'],
+            key_on='feature.properties.SIG_KOR_NM', # GeoJSON의 시군구 한글 이름 속성
+            fill_color='RdYlGn', # Red-Yellow-Green (감소-변화없음-증가)
+            fill_opacity=0.7,
+            line_opacity=0.2,
+            legend_name='Change Rate (증감률)',
+            highlight=True,
+            name='Choropleth',
+            # vmin=min_val,
+            # vmax=max_val
+            # bounds=[[min_val, max_val]] # vmin, vmax 대신 bounds 사용도 가능
+        ).add_to(m)
 
-        geo_df = load_geojson(GEOJSON_PATH)
-        merged_gdf = merge_geo_data(geo_df, result_df)
+        # 툴팁 추가 (지역명, 증감률)
+        choropleth.geojson.add_child(
+            folium.features.GeoJsonTooltip(
+                fields=['SIG_KOR_NM'], # GeoJSON의 시군구 이름 필드
+                aliases=['지역명'], # 사용자에게 보여질 라벨
+                localize=True # 한글 폰트 문제 방지
+            )
+        )
 
-        st.subheader("🗺️ 지역별 증감률 지도")
-        map_data = plot_colormap_with_geojson(merged_gdf)
+        # Choropleth 객체에서 색상 스케일을 가져와서 툴팁에 증감률 추가
+        choropleth.geojson.add_child(folium.features.GeoJson(
+            data=geojson_data,
+            style_function=lambda x: {
+                'fillColor': choropleth.colormap(df.set_index('CLS_ID').loc[x['properties']['SIG_KOR_NM'], '증감률'])
+                if x['properties']['SIG_KOR_NM'] in df['CLS_ID'].values else '#FFFFFF', # 데이터 없으면 흰색
+                'color': 'black',
+                'weight': 0.5,
+                'fillOpacity': 0.7
+            },
+            tooltip=folium.features.GeoJsonTooltip(
+                fields=['SIG_KOR_NM'],
+                aliases=['지역명'],
+                labels=True,
+                sticky=True,
+                style="""
+                    background-color: #F0EFEF;
+                    border: 2px solid black;
+                    border-radius: 3px;
+                    box-shadow: 3px;
+                    font-size: 12px;
+                    padding: 5px;
+                """,
+                # Custom function to add '증감률'
+                # 이 부분에서 증감률 정보를 추가해야 함
+                # Python 3.10+ 버전에서 f-string 안에 람다 사용이 가능하지만,
+                # Streamlit 환경에서 안정성을 위해 함수 밖에서 데이터를 가져와서 전달
+                get_html=lambda x: f"<b>지역명:</b> {x['properties']['SIG_KOR_NM']}<br>"
+                                   f"<b>증감률:</b> {df[df['CLS_ID'] == x['properties']['SIG_KOR_NM']]['증감률'].iloc[0]:.2f}%"
+                                   if x['properties']['SIG_KOR_NM'] in df['CLS_ID'].values and not df[df['CLS_ID'] == x['properties']['SIG_KOR_NM']]['증감률'].empty
+                                   else f"<b>지역명:</b> {x['properties']['SIG_KOR_NM']}<br><b>증감률:</b> 데이터 없음"
+            )
+        ))
+    return m
 
-        clicked_name = None
-        if map_data and map_data.get("last_active_drawing"):
-            props = map_data["last_active_drawing"].get("properties", {})
-            clicked_name = props.get("SIG_KOR_NM")
+# Streamlit 앱 시작
+st.set_page_config(layout="wide", page_title="지역별 주택 매매지수 증감률", page_icon="🏠")
 
-        if clicked_name:
-            matched_code = None
-            for code, name in cls_id_to_name_map.items():
-                if name.endswith(clicked_name.strip()):
-                    matched_code = code
-                    break
+st.title("🏡 지역별 주택 매매지수 증감률 지도")
 
-            if matched_code:
-                region_data = df_full[df_full["CLS_ID"] == matched_code].sort_values("날짜")
-                if not region_data.empty:
-                    st.subheader(f"📉 {clicked_name} 지수 추이")
-                    chart = alt.Chart(region_data).mark_line(point=True).encode(
-                        x="날짜:T",
-                        y=alt.Y("매매지수:Q", title="지수", scale=alt.Scale(zero=False)),
-                        tooltip=["날짜:T", "매매지수"]
-                    ).properties(width=700, height=300)
-                    st.altair_chart(chart, use_container_width=True)
+# 데이터 로드
+df_full = load_and_process_data(api_key)
+geojson_data = load_geojson()
+
+if df_full.empty:
+    st.info("데이터 로드에 실패했습니다. API 키 또는 네트워크 연결을 확인해주세요.")
+else:
+    min_date = df_full['날짜'].min()
+    max_date = df_full['날짜'].max()
+
+    if pd.isna(min_date) or pd.isna(max_date):
+        st.error("데이터에 유효한 날짜 범위가 없습니다.")
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date_input = st.date_input(
+                "시작 날짜",
+                min_value=min_date.date(),
+                max_value=max_date.date(),
+                value=min_date.date()
+            )
+        with col2:
+            end_date_input = st.date_input(
+                "종료 날짜",
+                min_value=min_date.date(),
+                max_value=max_date.date(),
+                value=max_date.date()
+            )
+
+        if start_date_input > end_date_input:
+            st.error("시작 날짜는 종료 날짜보다 빠르거나 같아야 합니다.")
+        else:
+            result_df = calc_change(df_full, pd.to_datetime(start_date_input), pd.to_datetime(end_date_input))
+
+            if not result_df.empty:
+                # Folium 지도 생성
+                map_object = create_choropleth_map(result_df, geojson_data)
+
+                if map_object:
+                    st.components.v1.html(folium.Figure().add_child(map_object).render(), height=700)
                 else:
-                    st.warning("❗ 해당 지역 데이터 없음")
+                    st.info("지도를 생성할 수 없습니다. 데이터 또는 GeoJSON 파일을 확인해주세요.")
+            else:
+                st.info("선택된 기간에 대한 증감률 데이터를 계산할 수 없습니다. 날짜 범위를 다시 확인해주세요.")
